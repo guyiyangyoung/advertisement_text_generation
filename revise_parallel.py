@@ -16,7 +16,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 model_name = "/mnt/bn/ug-diffusion-yg-nas/guyiyang/Qwen3-8B"
 
 
-def worker(gpu_id, row_idxs, df_path, output_file_path):
+def worker(gpu_id, row_idxs, df_path, output_file_path, batch_size=8):
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
     device = torch.device("cuda")
 
@@ -47,36 +47,61 @@ def worker(gpu_id, row_idxs, df_path, output_file_path):
         print(f"模型加载失败: {e}")
         exit(1)
 
-    def get_asr_result_qwen(messages):
+    def get_asr_result_qwen_batch(batch_messages):
+        """
+        批量处理消息
+        batch_messages: list of messages, 每个元素是一个对话消息列表
+        """
         outputs = None
-        # 示例输入
-        # messages = [{"role": "user", "content": prompt}]
         try:
-            # 生成带attention mask的输入
-            inputs = tokenizer.apply_chat_template(
-                messages, 
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=16384
-            )
+            # 为每个对话应用聊天模板
+            batch_inputs = []
+            for messages in batch_messages:
+                inputs = tokenizer.apply_chat_template(
+                    messages, 
+                    return_tensors="pt",
+                    padding=False,  # 先不padding，后面统一处理
+                    truncation=True,
+                    max_length=16384
+                )
+                batch_inputs.append(inputs.squeeze(0))  # 移除batch维度
             
-            attention_mask = (inputs != tokenizer.pad_token_id).long()
-            inputs = inputs.to(device)
-            attention_mask = attention_mask.to(device)
+            # 统一padding到最大长度
+            max_length = max(len(inp) for inp in batch_inputs)
+            padded_inputs = []
+            attention_masks = []
             
+            for inp in batch_inputs:
+                # 左padding
+                pad_length = max_length - len(inp)
+                if pad_length > 0:
+                    padded_inp = torch.cat([torch.full((pad_length,), tokenizer.pad_token_id), inp])
+                    attention_mask = torch.cat([torch.zeros(pad_length), torch.ones(len(inp))])
+                else:
+                    padded_inp = inp
+                    attention_mask = torch.ones(len(inp))
+                
+                padded_inputs.append(padded_inp)
+                attention_masks.append(attention_mask)
+            
+            # 转换为tensor
+            inputs = torch.stack(padded_inputs).to(device)
+            attention_mask = torch.stack(attention_masks).long().to(device)
+            
+            print(f"批处理输入张量形状: {inputs.shape}")
+            print(f"批处理attention mask形状: {attention_mask.shape}")
             print(f"输入张量设备: {inputs.device}")
             print(f"Attention mask设备: {attention_mask.device}")
         except Exception as e:
-            print(f"输入处理失败: {e}")
-            exit(1)
+            print(f"批处理输入处理失败: {e}")
+            return [None] * len(batch_messages)
 
         generate_config = {
             "max_new_tokens": 16384,
             "do_sample": True,
             "top_p": 0.8,
             "temperature": 0.35,
-            "attention_mask": attention_mask,  # 显式传入attention mask
+            "attention_mask": attention_mask,
             "pad_token_id": tokenizer.pad_token_id,
             "eos_token_id": tokenizer.eos_token_id,
         }
@@ -87,13 +112,19 @@ def worker(gpu_id, row_idxs, df_path, output_file_path):
                     inputs,
                     **generate_config
                 )
-            response_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-            return response_text
+            
+            # 解码每个输出
+            response_texts = []
+            for i, output in enumerate(outputs):
+                response_text = tokenizer.decode(output, skip_special_tokens=True)
+                response_texts.append(response_text)
+            
+            return response_texts
         except Exception as e:
-            print(f"生成回答失败: {e}")
+            print(f"批处理生成回答失败: {e}")
             print("\n当前输入设备:", inputs.device)
             print("首个参数设备:", next(model.parameters()).device)
-            return None
+            return [None] * len(batch_messages)
         
     def extract_json_after_output(response_text):
         # 匹配 #输出 后的首个 json 块（支持跨行、忽略前空格）
@@ -119,14 +150,17 @@ def worker(gpu_id, row_idxs, df_path, output_file_path):
             print("没有找到 #输出 后的JSON。")
             return None
     
-    def revise_asr(asr, ocr):
+    def revise_asr_batch(asr_list, ocr_list):
+        """
+        批量处理ASR和OCR文本
+        """
         demo_system_text = f'''
         # 角色:
         你是一名专业的文案优化师，擅长将长篇ASR文本和OCR文本，修改为专业脚本文案。
 
         ## 目标:
         - 去掉末尾不完整的句子。
-        - 去掉末尾营销号召的文字，如果有的话。比如，“点击下方链接，免费获取全文！”，“来番茄小说，发现更多精彩！”，“点击下方链接，即可观看全文！”，“点击视频下方，继续阅读全文！”
+        - 去掉末尾营销号召的文字，如果有的话。比如，"点击下方链接，免费获取全文！"，"来番茄小说，发现更多精彩！"，"点击下方链接，即可观看全文！"，"点击视频下方，继续阅读全文！"
         - 根据OCR修正ASR发音相同或相似的错别字。ASR文本存在着发音相同或者相似的错别字，找出所有用词不当或者语义不明的词，结合OCR和上下文理解修改这些错别字。尤其注意人名、地名、物名等。
         - 修正涉政涉黄的词语，如政治人物、政治事件、党派描述、国家象征、国旗国徽、军装等。
         - 使用吸睛的话术把文案改得更有吸引力。明确指出谁在说话，可以多使用转折词（例如：突然、一下子、回过头来等），上下对话之间要有问答关联（比如：是啊，对啊等词汇），快速让人明白存在的冲突，吸引人注意。
@@ -157,7 +191,7 @@ def worker(gpu_id, row_idxs, df_path, output_file_path):
         输出：
         {{
             "文案": "老爷子的话语让王平有种心惊肉跳的感觉，那里的事情只有自己一个人知道，他怎么突然问起这个了",
-            "修改说明":"“王平”等人名以OCR为准，“纪委”是涉政敏感词，修改成代词“那里”。"
+            "修改说明":""王平"等人名以OCR为准，"纪委"是涉政敏感词，修改成代词"那里"。"
             }}
 
         示例二：  
@@ -167,7 +201,7 @@ def worker(gpu_id, row_idxs, df_path, output_file_path):
         输出：     
         {{
             "文案": "养子不在家，你老实给我说，你是不是出去吃烧烤啦",
-            "修改说明":"’养子‘以OCR为准，结合OCR和上下文，“老是”是asr错别字，应该是发音相似的“老实”，“不时时”是asr错别字，应该是发音相似的“是不是”。"
+            "修改说明":"'养子'以OCR为准，结合OCR和上下文，"老是"是asr错别字，应该是发音相似的"老实"，"不时时"是asr错别字，应该是发音相似的"是不是"。"
             }}
 
         示例三：
@@ -177,78 +211,118 @@ def worker(gpu_id, row_idxs, df_path, output_file_path):
         输出： 
         {{
             "文案": "军医院总院长王平死死抱住一位佩戴着玉佩的年轻男人，...凝视着年轻人，越看越觉得他与自己的弟弟相像，而且当初弟弟下去劳动回来，龙佩就不见了...小伙子就叫王浩，他身上还有您给弟弟的龙佩",
-            "修改说明":"“王平”等人名以OCR为准，结合上下文，“隆沛”是asr错别字，应该是发音相似的“龙佩”。"
+            "修改说明":""王平"等人名以OCR为准，结合上下文，"隆沛"是asr错别字，应该是发音相似的"龙佩"。"
             }}
         示例四：  
         输入：
-        ASR：老爷子成因后说：“你们都在那等我，我马上过来。” 
-        OCR：老爷子沉吟后说：“你们都在那等我，我马上过来。”
+        ASR：老爷子成因后说："你们都在那等我，我马上过来。" 
+        OCR：老爷子沉吟后说："你们都在那等我，我马上过来。"
         输出：
         {{
-            "文案": "老爷子稍微沉吟了一下，突然坚定地说道，“你们都在那里等我，我马上过来。”",
-            "修改说明":"’沉吟‘以OCR为准，加入“突然”等转折词，快速让人明白存在的冲突，吸引人注意。"
+            "文案": "老爷子稍微沉吟了一下，突然坚定地说道，"你们都在那里等我，我马上过来。"",
+            "修改说明":"'沉吟'以OCR为准，加入"突然"等转折词，快速让人明白存在的冲突，吸引人注意。"
             }}  
         示例五：  
         输入：
-        ASR：他看着他，深情的问到“他怎么样了” 
+        ASR：他看着他，深情的问到"他怎么样了" 
         OCR：她看着他，深情的问到，她怎么样了 
         输出：
         {{
-            "文案": "她看着他，深情的问到“她怎么样了“",
-            "修改说明":"’她‘以OCR为准"
+            "文案": "她看着他，深情的问到"她怎么样了"",
+            "修改说明":"'她'以OCR为准"
             }}  
         '''
 
-        content_text =f'''
+        # 构建批量消息
+        batch_messages = []
+        for asr, ocr in zip(asr_list, ocr_list):
+            content_text = f'''
         #输入
         ASR:{asr}
         OCR:{ocr}
         #输出
         '''
-        messages = [
-            {"role": "system", "content": demo_system_text},
-            {"role": "user", "content": content_text},
-        ]
-        res_dict = None
-        for _ in range(1):
-            try:
-                results = get_asr_result_qwen(messages)
-                res_dict = extract_json_after_output(results)
-                break
-            except Exception as e:
-                print(f"JSON解析失败: {e}")
-                continue
-        return res_dict
+            messages = [
+                {"role": "system", "content": demo_system_text},
+                {"role": "user", "content": content_text},
+            ]
+            batch_messages.append(messages)
+
+        # 批量生成结果
+        batch_results = get_asr_result_qwen_batch(batch_messages)
+        
+        # 解析每个结果
+        res_dicts = []
+        for result in batch_results:
+            if result is not None:
+                res_dict = extract_json_after_output(result)
+                res_dicts.append(res_dict)
+            else:
+                res_dicts.append(None)
+        
+        return res_dicts
 
     # 读取需要处理的全部行
     df = pd.read_csv(df_path)
-    first_row = True
-    for index in row_idxs:
-        print(index)
-        asr = df.loc[index, "raw_asr"]
-        ocr = df.loc[index, "raw_ocr"]
+    first_write = True
+    
+    # 按批次处理数据
+    for i in range(0, len(row_idxs), batch_size):
+        batch_indices = row_idxs[i:i+batch_size]
+        print(f"处理批次: {batch_indices}")
         
-        category_v2_name0 = df.loc[index, "category_v2_name"]
-        if "评书" in category_v2_name0:
-            df.at[index, 'revise_asr'] = 'error1'
-        else:
+        # 收集当前批次的数据
+        batch_asr = []
+        batch_ocr = []
+        batch_categories = []
+        
+        for index in batch_indices:
+            asr = df.loc[index, "raw_asr"]
+            ocr = df.loc[index, "raw_ocr"]
+            category_v2_name = df.loc[index, "category_v2_name"]
+            
+            batch_asr.append(asr)
+            batch_ocr.append(ocr)
+            batch_categories.append(category_v2_name)
+        
+        # 过滤掉"评书"类别的数据
+        valid_indices = []
+        valid_asr = []
+        valid_ocr = []
+        
+        for j, (index, category) in enumerate(zip(batch_indices, batch_categories)):
+            if "评书" in category:
+                df.at[index, 'revise_asr'] = 'error1'
+            else:
+                valid_indices.append(index)
+                valid_asr.append(batch_asr[j])
+                valid_ocr.append(batch_ocr[j])
+        
+        # 批量处理有效数据
+        if valid_indices:
             try:
-                fix_text_dict = revise_asr(asr, ocr)
-                print(fix_text_dict)
-                if fix_text_dict and '文案' in fix_text_dict:
-                    df.at[index, 'revise_asr'] = fix_text_dict['文案']
-                else:
-                    df.at[index, 'revise_asr'] = ""
-            except:
-                print("error happening...")
-                df.at[index, 'revise_asr'] = "error2"
+                batch_results = revise_asr_batch(valid_asr, valid_ocr)
+                print(f"批次结果: {len(batch_results)} 个结果")
+                
+                # 更新DataFrame
+                for k, (index, result) in enumerate(zip(valid_indices, batch_results)):
+                    if result and '文案' in result:
+                        df.at[index, 'revise_asr'] = result['文案']
+                    else:
+                        df.at[index, 'revise_asr'] = ""
+            except Exception as e:
+                print(f"批次处理错误: {e}")
+                # 如果批次处理失败，标记为错误
+                for index in valid_indices:
+                    df.at[index, 'revise_asr'] = "error2"
         
-        # 流式写入当前行
-        if first_row:
-            df.loc[[index]].to_csv(output_file_path, index=False)
-            first_row = False
+        # 流式写入当前批次的行
+        batch_df = df.loc[batch_indices]
+        if first_write:
+            batch_df.to_csv(output_file_path, index=False)
+            first_write = False
         else:
-            df.loc[[index]].to_csv(output_file_path, mode='a', header=False, index=False)
+            batch_df.to_csv(output_file_path, mode='a', header=False, index=False)
 
 def main():
     df_path = '/mnt/bn/ug-diffusion-yg-nas/guyiyang/data/all_generated_scripts_costlargerthan_1000.csv'
