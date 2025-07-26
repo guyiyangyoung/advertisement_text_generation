@@ -266,10 +266,14 @@ def worker(gpu_id, row_idxs, df_path, output_file_path, batch_size=8):
     df = pd.read_csv(df_path)
     first_write = True
     
+    # 计算总批次数
+    total_batches = (len(row_idxs) + batch_size - 1) // batch_size
+    print(f"GPU {gpu_id}: 总共需要处理 {len(row_idxs)} 行数据，分为 {total_batches} 个批次")
+    
     # 按批次处理数据
-    for i in range(0, len(row_idxs), batch_size):
+    for batch_idx, i in enumerate(range(0, len(row_idxs), batch_size)):
         batch_indices = row_idxs[i:i+batch_size]
-        print(f"处理批次: {batch_indices}")
+        print(f"GPU {gpu_id}: 处理批次 {batch_idx + 1}/{total_batches}: {batch_indices}")
         
         # 收集当前批次的数据
         batch_asr = []
@@ -300,29 +304,62 @@ def worker(gpu_id, row_idxs, df_path, output_file_path, batch_size=8):
         
         # 批量处理有效数据
         if valid_indices:
-            try:
-                batch_results = revise_asr_batch(valid_asr, valid_ocr)
-                print(f"批次结果: {len(batch_results)} 个结果")
-                
-                # 更新DataFrame
-                for k, (index, result) in enumerate(zip(valid_indices, batch_results)):
-                    if result and '文案' in result:
-                        df.at[index, 'revise_asr'] = result['文案']
+            max_retries = 3
+            success = False
+            
+            for retry in range(max_retries):
+                try:
+                    print(f"GPU {gpu_id}: 批次 {batch_idx + 1} 尝试第 {retry + 1} 次处理 {len(valid_indices)} 个有效样本")
+                    batch_results = revise_asr_batch(valid_asr, valid_ocr)
+                    print(f"GPU {gpu_id}: 批次 {batch_idx + 1} 处理成功，获得 {len(batch_results)} 个结果")
+                    
+                    # 更新DataFrame
+                    for k, (index, result) in enumerate(zip(valid_indices, batch_results)):
+                        if result and '文案' in result:
+                            df.at[index, 'revise_asr'] = result['文案']
+                        else:
+                            df.at[index, 'revise_asr'] = ""
+                    
+                    success = True
+                    break
+                    
+                except Exception as e:
+                    print(f"GPU {gpu_id}: 批次 {batch_idx + 1} 第 {retry + 1} 次尝试失败: {e}")
+                    if retry < max_retries - 1:
+                        print(f"GPU {gpu_id}: 等待5秒后重试...")
+                        time.sleep(5)
+                        # 清理GPU内存
+                        torch.cuda.empty_cache()
                     else:
-                        df.at[index, 'revise_asr'] = ""
-            except Exception as e:
-                print(f"批次处理错误: {e}")
-                # 如果批次处理失败，标记为错误
-                for index in valid_indices:
-                    df.at[index, 'revise_asr'] = "error2"
+                        print(f"GPU {gpu_id}: 批次 {batch_idx + 1} 所有重试都失败，标记为错误")
+                        # 如果所有重试都失败，标记为错误
+                        for index in valid_indices:
+                            df.at[index, 'revise_asr'] = "error2"
         
         # 流式写入当前批次的行
-        batch_df = df.loc[batch_indices]
-        if first_write:
-            batch_df.to_csv(output_file_path, index=False)
-            first_write = False
-        else:
-            batch_df.to_csv(output_file_path, mode='a', header=False, index=False)
+        try:
+            batch_df = df.loc[batch_indices]
+            if first_write:
+                batch_df.to_csv(output_file_path, index=False)
+                first_write = False
+            else:
+                batch_df.to_csv(output_file_path, mode='a', header=False, index=False)
+            print(f"GPU {gpu_id}: 批次 {batch_idx + 1} 结果已保存到文件")
+        except Exception as e:
+            print(f"GPU {gpu_id}: 批次 {batch_idx + 1} 保存文件失败: {e}")
+        
+        # 每一轮batch后的清理和状态更新
+        torch.cuda.empty_cache()  # 清理GPU内存
+        
+        # 显示进度
+        progress = (batch_idx + 1) / total_batches * 100
+        print(f"GPU {gpu_id}: 进度 {progress:.1f}% ({batch_idx + 1}/{total_batches})")
+        
+        # 可选：添加短暂延迟，避免GPU过热
+        if batch_idx < total_batches - 1:  # 不是最后一个批次
+            time.sleep(1)
+    
+    print(f"GPU {gpu_id}: 所有批次处理完成！")
 
 def main():
     df_path = '/mnt/bn/ug-diffusion-yg-nas/guyiyang/data/all_generated_scripts_costlargerthan_1000.csv'
