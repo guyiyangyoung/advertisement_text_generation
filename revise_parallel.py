@@ -6,6 +6,7 @@ import json
 import re
 import time
 import torch
+import gc  # 添加垃圾回收模块
 from multiprocessing import Process
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextStreamer
 
@@ -19,6 +20,14 @@ model_name = "/mnt/bn/ug-diffusion-yg-nas/guyiyang/Qwen3-8B"
 def worker(gpu_id, row_idxs, df_path, output_file_path, batch_size=8):
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
     device = torch.device("cuda")
+
+    def clear_memory():
+        """清理GPU和系统内存"""
+        torch.cuda.empty_cache()  # 清理GPU缓存
+        gc.collect()  # 强制垃圾回收
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()  # 同步CUDA操作
+        print(f"GPU {gpu_id}: 内存已清理")
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(
@@ -43,6 +52,9 @@ def worker(gpu_id, row_idxs, df_path, output_file_path, batch_size=8):
         ).eval()
         model = model.to(device)
         print(f"模型已成功加载到 GPU {gpu_id}")
+        
+        # 模型加载后清理一次内存
+        clear_memory()
     except Exception as e:
         print(f"模型加载失败: {e}")
         exit(1)
@@ -119,11 +131,25 @@ def worker(gpu_id, row_idxs, df_path, output_file_path, batch_size=8):
                 response_text = tokenizer.decode(output, skip_special_tokens=True)
                 response_texts.append(response_text)
             
+            # 批量推理完成后立即清理中间变量
+            del outputs, inputs, attention_mask
+            torch.cuda.empty_cache()
+            
             return response_texts
         except Exception as e:
             print(f"批处理生成回答失败: {e}")
             print("\n当前输入设备:", inputs.device)
             print("首个参数设备:", next(model.parameters()).device)
+            
+            # 出错时也要清理内存
+            if 'outputs' in locals():
+                del outputs
+            if 'inputs' in locals():
+                del inputs
+            if 'attention_mask' in locals():
+                del attention_mask
+            torch.cuda.empty_cache()
+            
             return [None] * len(batch_messages)
         
     def extract_json_after_output(response_text):
@@ -329,7 +355,7 @@ def worker(gpu_id, row_idxs, df_path, output_file_path, batch_size=8):
                         print(f"GPU {gpu_id}: 等待5秒后重试...")
                         time.sleep(5)
                         # 清理GPU内存
-                        torch.cuda.empty_cache()
+                        clear_memory()
                     else:
                         print(f"GPU {gpu_id}: 批次 {batch_idx + 1} 所有重试都失败，标记为错误")
                         # 如果所有重试都失败，标记为错误
@@ -348,8 +374,22 @@ def worker(gpu_id, row_idxs, df_path, output_file_path, batch_size=8):
         except Exception as e:
             print(f"GPU {gpu_id}: 批次 {batch_idx + 1} 保存文件失败: {e}")
         
-        # 每一轮batch后的清理和状态更新
-        torch.cuda.empty_cache()  # 清理GPU内存
+        # 每一轮batch后的全面内存清理
+        # 清理batch相关的局部变量
+        del batch_asr, batch_ocr, batch_categories
+        if valid_indices:
+            del valid_asr, valid_ocr
+        if 'batch_results' in locals():
+            del batch_results
+        
+        # 调用完整的内存清理函数
+        clear_memory()
+        
+        # 显示内存使用情况
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated(device) / 1024**3  # GB
+            cached = torch.cuda.memory_reserved(device) / 1024**3  # GB
+            print(f"GPU {gpu_id}: 内存使用 - 已分配: {allocated:.2f}GB, 已缓存: {cached:.2f}GB")
         
         # 显示进度
         progress = (batch_idx + 1) / total_batches * 100
@@ -360,6 +400,19 @@ def worker(gpu_id, row_idxs, df_path, output_file_path, batch_size=8):
             time.sleep(1)
     
     print(f"GPU {gpu_id}: 所有批次处理完成！")
+    
+    # 最终清理：释放模型和tokenizer占用的内存
+    print(f"GPU {gpu_id}: 开始最终内存清理...")
+    del model, tokenizer
+    clear_memory()
+    
+    # 显示最终内存状态
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated(device) / 1024**3
+        cached = torch.cuda.memory_reserved(device) / 1024**3
+        print(f"GPU {gpu_id}: 最终内存状态 - 已分配: {allocated:.2f}GB, 已缓存: {cached:.2f}GB")
+    
+    print(f"GPU {gpu_id}: 进程完全结束！")
 
 def main():
     df_path = '/mnt/bn/ug-diffusion-yg-nas/guyiyang/data/all_generated_scripts_costlargerthan_1000.csv'
