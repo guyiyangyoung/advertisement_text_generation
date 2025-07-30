@@ -90,18 +90,24 @@ class QwenFineTuner:
         
         logger.info("Model and tokenizer setup complete")
     
-    def format_conversation(self, instruction: str, output: str) -> str:
-        """Format instruction and output into conversation format for Qwen"""
+    def format_conversation(self, instruction: str, input_text: str, output: str) -> str:
+        """Format instruction, input and output into conversation format for Qwen"""
+        # Combine instruction and input for the user message
+        if input_text.strip():
+            user_message = f"{instruction}\n\n{input_text}"
+        else:
+            user_message = instruction
+            
         # Qwen conversation format
-        conversation = f"<|im_start|>system\n你是一个专业的广告文案创作助手，擅长根据详细的内容创作吸引人的广告文案。<|im_end|>\n<|im_start|>user\n{instruction}<|im_end|>\n<|im_start|>assistant\n{output}<|im_end|>"
+        conversation = f"<|im_start|>system\n你是一个专业的广告文案创作助手，擅长根据详细的内容创作吸引人的广告文案。<|im_end|>\n<|im_start|>user\n{user_message}<|im_end|>\n<|im_start|>assistant\n{output}<|im_end|>"
         return conversation
     
     def tokenize_function(self, examples: Dict) -> Dict:
         """Tokenize the examples for training"""
         # Format conversations
         conversations = []
-        for instruction, output in zip(examples["instruction"], examples["output"]):
-            conversation = self.format_conversation(instruction, output)
+        for instruction, input_text, output in zip(examples["instruction"], examples["input"], examples["output"]):
+            conversation = self.format_conversation(instruction, input_text, output)
             conversations.append(conversation)
         
         # Tokenize

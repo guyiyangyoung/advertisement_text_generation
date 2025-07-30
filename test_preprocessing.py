@@ -104,18 +104,10 @@ def test_preprocessing(csv_path: str):
         formatted_chapters = preprocessor.format_chapters_as_text(chapters)
         print(f"✓ Formatted chapters (length: {len(formatted_chapters)})")
         
-        # Create prompt
-        prompt = preprocessor.create_training_prompt(formatted_chapters)
-        print(f"✓ Created training prompt (length: {len(prompt)})")
-        
         # Show formatted output
-        print("\nFormatted Chapters Text:")
+        print("\nFormatted Chapters Text (Input):")
         print("-" * 30)
         print(formatted_chapters[:500] + "..." if len(formatted_chapters) > 500 else formatted_chapters)
-        
-        print("\nTraining Prompt:")
-        print("-" * 30)
-        print(prompt[:500] + "..." if len(prompt) > 500 else prompt)
         
         print("\nTarget Output:")
         print("-" * 30)

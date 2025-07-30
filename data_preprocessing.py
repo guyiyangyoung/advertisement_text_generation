@@ -53,16 +53,8 @@ class DataPreprocessor:
     
     def create_training_prompt(self, chapters_text: str) -> str:
         """Create a structured prompt for training"""
-        prompt = f"""请根据以下详细的章节内容，生成一段优秀的广告文案。广告文案应该：
-1. 抓住读者的注意力
-2. 突出内容的亮点和吸引力
-3. 激发读者的阅读兴趣
-4. 语言生动有趣
-
-章节详情：
-{chapters_text}
-
-广告文案："""
+        # Simple, direct instruction that focuses on the task
+        prompt = f"请根据以下章节内容生成优秀的广告文案：\n\n{chapters_text}"
         return prompt
     
     def prepare_training_data(self) -> List[Dict[str, str]]:
@@ -87,14 +79,11 @@ class DataPreprocessor:
                 print(f"Skipping row {idx}: Missing data")
                 continue
             
-            # Create training prompt
-            input_text = self.create_training_prompt(formatted_chapters)
-            
-            # Create training example
+            # Create training example with clear separation
             training_example = {
-                "instruction": input_text,
-                "output": str(row['revise_asr']).strip(),
-                "input": ""  # Empty input as we include everything in instruction
+                "instruction": "请根据以下章节内容生成优秀的广告文案",
+                "input": formatted_chapters,  # The chapters_text is the actual input
+                "output": str(row['revise_asr']).strip()  # The revise_asr is the target output
             }
             
             training_data.append(training_example)
