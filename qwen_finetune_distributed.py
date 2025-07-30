@@ -190,7 +190,7 @@ class DistributedQwenFineTuner:
             logging_steps=logging_steps,
             save_steps=save_steps,
             eval_steps=eval_steps,
-            evaluation_strategy="steps",
+            eval_strategy="steps",
             save_strategy="steps",
             save_total_limit=save_total_limit,
             load_best_model_at_end=True,
