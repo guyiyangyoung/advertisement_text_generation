@@ -23,7 +23,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class DistributedQwenFineTuner:
-    """Distributed Fine-tuner for Qwen-3 8B model using multiple GPUs"""
+    """分布式Qwen-3 8B微调器，支持多GPU并行训练"""
     
     def __init__(self, 
                  model_name: str = "Qwen/Qwen2.5-8B-Instruct",
@@ -36,9 +36,27 @@ class DistributedQwenFineTuner:
         self.model = None
         self.data_collator = None
         
+        # 初始化分布式环境
+        self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        self.world_size = int(os.environ.get("WORLD_SIZE", 1))
+        self.rank = int(os.environ.get("RANK", 0))
+        
+    def setup_distributed(self):
+        """设置分布式训练环境"""
+        if self.world_size > 1:
+            if not dist.is_initialized():
+                dist.init_process_group(backend="nccl")
+            torch.cuda.set_device(self.local_rank)
+            
+            if self.rank == 0:
+                logger.info(f"Initialized distributed training on {self.world_size} GPUs")
+        else:
+            logger.info("Single GPU training mode")
+        
     def setup_model_and_tokenizer(self):
-        """Initialize model and tokenizer with quantization if specified"""
-        logger.info(f"Loading model: {self.model_name}")
+        """初始化模型和分词器"""
+        if self.rank == 0:
+            logger.info(f"Loading model: {self.model_name}")
         
         # Setup tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -61,15 +79,36 @@ class DistributedQwenFineTuner:
                 bnb_4bit_compute_dtype=torch.float16,
                 bnb_4bit_use_double_quant=True,
             )
+            if self.rank == 0:
+                logger.info("Using 4-bit quantization for memory efficiency")
         
-        # Load model with device_map="auto" for multi-GPU
+        # Load model with device_map for multi-GPU
+        if self.world_size > 1:
+            # 分布式训练时不使用device_map，让DDP处理
+            device_map = None
+        else:
+            # 单GPU时使用device_map
+            device_map = "auto"
+            
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
             quantization_config=quantization_config,
-            device_map="auto",  # Automatically distribute across available GPUs
+            device_map=device_map,
             trust_remote_code=True,
             torch_dtype=torch.float16 if not self.use_quantization else None
         )
+        
+        # 分布式训练时手动移动模型到当前GPU
+        if self.world_size > 1 and not self.use_quantization:
+            self.model = self.model.to(f"cuda:{self.local_rank}")
+        
+        # Print GPU memory usage (only on rank 0)
+        if self.rank == 0 and torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                memory_allocated = torch.cuda.memory_allocated(i) / 1024**3
+                memory_reserved = torch.cuda.memory_reserved(i) / 1024**3
+                memory_total = torch.cuda.get_device_properties(i).total_memory / 1024**3
+                logger.info(f"GPU {i} Memory - Allocated: {memory_allocated:.2f}GB, Reserved: {memory_reserved:.2f}GB, Total: {memory_total:.2f}GB")
         
         # Setup LoRA if specified
         if self.use_lora:
@@ -82,8 +121,9 @@ class DistributedQwenFineTuner:
             )
             self.model = get_peft_model(self.model, lora_config)
             
-            if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+            if self.rank == 0:
                 self.model.print_trainable_parameters()
+                logger.info("LoRA adapters added for efficient fine-tuning")
         
         # Setup data collator
         self.data_collator = DataCollatorForSeq2Seq(
@@ -93,26 +133,21 @@ class DistributedQwenFineTuner:
             pad_to_multiple_of=8
         )
         
-        logger.info("Model and tokenizer setup complete")
+        if self.rank == 0:
+            logger.info("Model and tokenizer setup complete")
     
-    def format_conversation(self, instruction: str, input_text: str, output: str) -> str:
-        """Format instruction, input and output into conversation format for Qwen"""
-        # Combine instruction and input for the user message
-        if input_text.strip():
-            user_message = f"{instruction}\n\n{input_text}"
-        else:
-            user_message = instruction
-            
+    def format_conversation(self, instruction: str, output: str) -> str:
+        """格式化指令和输出为Qwen对话格式"""
         # Qwen conversation format
-        conversation = f"<|im_start|>system\n你是一个专业的广告文案创作助手，擅长根据详细的内容创作吸引人的广告文案。<|im_end|>\n<|im_start|>user\n{user_message}<|im_end|>\n<|im_start|>assistant\n{output}<|im_end|>"
+        conversation = f"<|im_start|>system\n你是一个专业的广告文案创作助手，擅长根据详细的内容创作吸引人的广告文案。<|im_end|>\n<|im_start|>user\n{instruction}<|im_end|>\n<|im_start|>assistant\n{output}<|im_end|>"
         return conversation
     
     def tokenize_function(self, examples: Dict) -> Dict:
-        """Tokenize the examples for training"""
+        """对训练样本进行分词"""
         # Format conversations
         conversations = []
-        for instruction, input_text, output in zip(examples["instruction"], examples["input"], examples["output"]):
-            conversation = self.format_conversation(instruction, input_text, output)
+        for instruction, output in zip(examples["instruction"], examples["output"]):
+            conversation = self.format_conversation(instruction, output)
             conversations.append(conversation)
         
         # Tokenize
@@ -130,8 +165,9 @@ class DistributedQwenFineTuner:
         return model_inputs
     
     def load_and_prepare_dataset(self, data_path: str, test_size: float = 0.1):
-        """Load and prepare dataset for training"""
-        logger.info(f"Loading dataset from {data_path}")
+        """加载和准备训练数据集"""
+        if self.rank == 0:
+            logger.info(f"Loading dataset from {data_path}")
         
         # Load the JSON data
         with open(data_path, 'r', encoding='utf-8') as f:
@@ -158,17 +194,18 @@ class DistributedQwenFineTuner:
             desc="Tokenizing eval dataset"
         )
         
-        logger.info(f"Train dataset size: {len(train_dataset)}")
-        logger.info(f"Eval dataset size: {len(eval_dataset)}")
+        if self.rank == 0:
+            logger.info(f"Train dataset size: {len(train_dataset)}")
+            logger.info(f"Eval dataset size: {len(eval_dataset)}")
         
         return train_dataset, eval_dataset
     
     def setup_training_arguments(self, 
                                 output_dir: str = "./qwen_advertising_copy_distributed",
                                 num_train_epochs: int = 3,
-                                per_device_train_batch_size: int = 4,
-                                per_device_eval_batch_size: int = 4,
-                                gradient_accumulation_steps: int = 2,
+                                per_device_train_batch_size: int = 2,
+                                per_device_eval_batch_size: int = 2,
+                                gradient_accumulation_steps: int = 4,  # 减少累积步数，因为有多GPU
                                 learning_rate: float = 5e-5,
                                 warmup_steps: int = 100,
                                 logging_steps: int = 10,
@@ -176,7 +213,7 @@ class DistributedQwenFineTuner:
                                 eval_steps: int = 500,
                                 save_total_limit: int = 3,
                                 use_wandb: bool = False):
-        """Setup training arguments for distributed training"""
+        """设置分布式训练参数"""
         
         return TrainingArguments(
             output_dir=output_dir,
@@ -199,15 +236,18 @@ class DistributedQwenFineTuner:
             fp16=True,
             dataloader_pin_memory=False,
             remove_unused_columns=False,
-            # Distributed training settings
-            ddp_find_unused_parameters=False,
+            gradient_checkpointing=True,
             dataloader_num_workers=4,
+            # 分布式训练设置
+            ddp_find_unused_parameters=False,
+            ddp_bucket_cap_mb=25,
+            ddp_broadcast_buffers=False,
             group_by_length=True,
             length_column_name="length",
-            # Logging and reporting
+            # 日志和报告
             report_to="wandb" if use_wandb else None,
             run_name="qwen-advertising-copy-distributed" if use_wandb else None,
-            # Performance optimizations
+            # 性能优化
             optim="adamw_torch",
             lr_scheduler_type="cosine",
             save_safetensors=True,
@@ -217,7 +257,10 @@ class DistributedQwenFineTuner:
               data_path: str,
               output_dir: str = "./qwen_advertising_copy_distributed",
               **training_kwargs):
-        """Main training function"""
+        """主训练函数"""
+        
+        # 设置分布式环境
+        self.setup_distributed()
         
         # Setup model and tokenizer
         self.setup_model_and_tokenizer()
@@ -227,6 +270,15 @@ class DistributedQwenFineTuner:
         
         # Setup training arguments
         training_args = self.setup_training_arguments(output_dir=output_dir, **training_kwargs)
+        
+        # Calculate effective batch size
+        effective_batch_size = (training_args.per_device_train_batch_size * 
+                              training_args.gradient_accumulation_steps * 
+                              self.world_size)
+        
+        if self.rank == 0:
+            logger.info(f"Effective batch size: {effective_batch_size}")
+            logger.info(f"Training on {self.world_size} GPU(s)")
         
         # Initialize trainer
         trainer = Trainer(
@@ -239,11 +291,12 @@ class DistributedQwenFineTuner:
         )
         
         # Start training
-        logger.info("Starting distributed training...")
+        if self.rank == 0:
+            logger.info("Starting distributed training...")
         trainer.train()
         
         # Save the final model (only on main process)
-        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        if self.rank == 0:
             logger.info("Saving final model...")
             trainer.save_model()
             
@@ -255,7 +308,7 @@ class DistributedQwenFineTuner:
         return trainer
 
 def main():
-    """Main function for distributed training"""
+    """主函数用于分布式训练"""
     
     parser = argparse.ArgumentParser(description="Distributed fine-tuning of Qwen-3 8B")
     parser.add_argument("--data_path", type=str, default="training_data.json",
@@ -266,9 +319,9 @@ def main():
                        help="Model name or path")
     parser.add_argument("--num_train_epochs", type=int, default=3,
                        help="Number of training epochs")
-    parser.add_argument("--per_device_train_batch_size", type=int, default=4,
+    parser.add_argument("--per_device_train_batch_size", type=int, default=2,
                        help="Batch size per device")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=2,
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4,
                        help="Gradient accumulation steps")
     parser.add_argument("--learning_rate", type=float, default=5e-5,
                        help="Learning rate")
@@ -289,21 +342,40 @@ def main():
     
     args = parser.parse_args()
     
-    # Check if data file exists
-    if not os.path.exists(args.data_path):
-        logger.error(f"Data file {args.data_path} not found. Please run data_preprocessing.py first.")
-        return
+    # 获取rank信息
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
     
-    # Log GPU information
-    if torch.cuda.is_available():
-        num_gpus = torch.cuda.device_count()
-        logger.info(f"Found {num_gpus} GPU(s)")
-        for i in range(num_gpus):
-            gpu_name = torch.cuda.get_device_name(i)
-            gpu_memory = torch.cuda.get_device_properties(i).total_memory / 1e9
-            logger.info(f"GPU {i}: {gpu_name} ({gpu_memory:.1f}GB)")
-    else:
-        logger.warning("No CUDA GPUs found")
+    # Check if data file exists (only on rank 0)
+    if local_rank == 0:
+        if not os.path.exists(args.data_path):
+            logger.error(f"Data file {args.data_path} not found. Please run data_preprocessing.py first.")
+            return
+        
+        # Check GPU availability and memory
+        if torch.cuda.is_available():
+            num_gpus = torch.cuda.device_count()
+            logger.info(f"Found {num_gpus} GPU(s) for distributed training")
+            for i in range(num_gpus):
+                gpu_name = torch.cuda.get_device_name(i)
+                gpu_memory = torch.cuda.get_device_properties(i).total_memory / 1024**3
+                logger.info(f"GPU {i}: {gpu_name} ({gpu_memory:.1f}GB)")
+                
+            # Memory requirement warning
+            total_memory = sum(torch.cuda.get_device_properties(i).total_memory for i in range(num_gpus)) / 1024**3
+            logger.info(f"Total GPU memory: {total_memory:.1f}GB")
+            
+            if not args.no_quantization:
+                logger.info("Using 4-bit quantization - minimum 12GB per GPU recommended")
+                min_memory_per_gpu = 12
+            else:
+                logger.info("Using full precision - minimum 24GB per GPU recommended")
+                min_memory_per_gpu = 24
+                
+            if total_memory / num_gpus < min_memory_per_gpu:
+                logger.warning(f"GPU memory may be insufficient. Each GPU should have at least {min_memory_per_gpu}GB")
+        else:
+            logger.error("No CUDA GPUs found. Distributed training requires multiple NVIDIA GPUs with CUDA support.")
+            return
     
     # Initialize fine-tuner
     fine_tuner = DistributedQwenFineTuner(
@@ -327,7 +399,7 @@ def main():
         use_wandb=args.use_wandb
     )
     
-    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+    if local_rank == 0:
         logger.info("Distributed fine-tuning completed successfully!")
 
 if __name__ == "__main__":
