@@ -23,9 +23,11 @@ class QwenInference:
     def __init__(self, 
                  model_path: str = "/mnt/bn/ug-diffusion-lq/guyiyang/qwen_advertising_copy",
                  base_model_path: str = "/mnt/bn/ug-diffusion-lq/guyiyang/Qwen3-8B",
-                 max_new_tokens: int = 512,
-                 temperature: float = 0.7,
+                 max_new_tokens: int = 256,
+                 temperature: float = 0.8,
                  top_p: float = 0.9,
+                 top_k: int = 50,
+                 repetition_penalty: float = 1.2,
                  do_sample: bool = True):
         
         self.model_path = model_path
@@ -33,6 +35,8 @@ class QwenInference:
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.top_p = top_p
+        self.top_k = top_k
+        self.repetition_penalty = repetition_penalty
         self.do_sample = do_sample
         self.device_count = torch.cuda.device_count()
         
@@ -111,19 +115,26 @@ class QwenInference:
         logger.debug(f"Prompt text: {conversation[:200]}...")
         
         with torch.no_grad():
-            # Generate outputs
+            # Generate outputs with anti-repetition settings
             outputs = self.model.generate(
                 input_ids=inputs['input_ids'],
                 attention_mask=inputs['attention_mask'],
                 max_new_tokens=self.max_new_tokens,
+                min_length=inputs['input_ids'].shape[1] + 10,  # Ensure minimum generation
                 temperature=self.temperature,
                 top_p=self.top_p,
+                top_k=self.top_k,
                 do_sample=self.do_sample,
                 pad_token_id=self.tokenizer.pad_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
-                repetition_penalty=1.1,
+                repetition_penalty=self.repetition_penalty,
                 length_penalty=1.0,
-                num_return_sequences=1
+                no_repeat_ngram_size=3,  # Prevent 3-gram repetitions
+                early_stopping=True,
+                num_return_sequences=1,
+                # Add custom stopping criteria
+                max_length=inputs['input_ids'].shape[1] + self.max_new_tokens,
+                use_cache=True
             )
         
         # Debug: Print generation info
@@ -183,11 +194,95 @@ class QwenInference:
             # 7. Remove any remaining empty lines at the start
             generated_text = generated_text.lstrip('\n ')
             
+                        # 8. Post-process to remove repetitive content
+            generated_text = self._remove_repetitive_content(generated_text)
+            
             logger.debug(f"Extracted generated text: {generated_text[:200]}...")
             return generated_text.strip()
         else:
             logger.warning("No new tokens were generated!")
             return "Error: No new content generated"
+    
+    def _remove_repetitive_content(self, text):
+        """Remove repetitive sentences and paragraphs from generated text"""
+        if not text:
+            return text
+        
+        # Split into sentences
+        sentences = re.split(r'[。！？.!?]', text)
+        sentences = [s.strip() for s in sentences if s.strip()]
+        
+        # Remove duplicate sentences
+        seen_sentences = set()
+        unique_sentences = []
+        
+        for sentence in sentences:
+            # Remove very short sentences (likely fragments)
+            if len(sentence) < 5:
+                continue
+                
+            # Check for similarity to existing sentences
+            is_duplicate = False
+            for seen in seen_sentences:
+                # Check if sentences are too similar (> 70% overlap)
+                if self._calculate_similarity(sentence, seen) > 0.7:
+                    is_duplicate = True
+                    break
+            
+            if not is_duplicate:
+                seen_sentences.add(sentence)
+                unique_sentences.append(sentence)
+        
+        # Rejoin sentences
+        result = '。'.join(unique_sentences)
+        if result and not result.endswith('。'):
+            result += '。'
+        
+        # Also check for repetitive patterns (like repeated phrases)
+        result = self._remove_repeated_phrases(result)
+        
+        return result
+    
+    def _calculate_similarity(self, s1, s2):
+        """Calculate similarity between two sentences"""
+        if not s1 or not s2:
+            return 0
+        
+        # Simple character-level similarity
+        set1 = set(s1)
+        set2 = set(s2)
+        
+        if not set1 or not set2:
+            return 0
+            
+        intersection = len(set1.intersection(set2))
+        union = len(set1.union(set2))
+        
+        return intersection / union if union > 0 else 0
+    
+    def _remove_repeated_phrases(self, text):
+        """Remove repeated phrases within the text"""
+        if not text:
+            return text
+        
+        # Split into words
+        words = text.split()
+        if len(words) < 10:
+            return text
+        
+        # Find repeated n-grams (sequences of words)
+        for n in range(8, 3, -1):  # Check 8-gram to 4-gram
+            for i in range(len(words) - 2*n + 1):
+                ngram = ' '.join(words[i:i+n])
+                # Look for the same n-gram later in the text
+                for j in range(i + n, len(words) - n + 1):
+                    if ' '.join(words[j:j+n]) == ngram:
+                        # Found repetition, truncate at the repetition point
+                        logger.debug(f"Found repeated phrase: {ngram}")
+                        truncated_words = words[:j]
+                        return ' '.join(truncated_words)
+        
+        return text
     
     def infer_from_csv(self, csv_path: str, output_path: str):
         """Run inference on test.csv and save results"""
@@ -278,12 +373,16 @@ def main():
                        help="Path to test CSV file")
     parser.add_argument("--output_path", type=str, default="inference_results.csv",
                        help="Path to save results")
-    parser.add_argument("--max_new_tokens", type=int, default=512,
+    parser.add_argument("--max_new_tokens", type=int, default=256,
                        help="Maximum number of new tokens to generate")
-    parser.add_argument("--temperature", type=float, default=0.7,
+    parser.add_argument("--temperature", type=float, default=0.8,
                        help="Temperature for generation")
     parser.add_argument("--top_p", type=float, default=0.9,
                        help="Top-p for nucleus sampling")
+    parser.add_argument("--top_k", type=int, default=50,
+                       help="Top-k for sampling")
+    parser.add_argument("--repetition_penalty", type=float, default=1.2,
+                       help="Repetition penalty to reduce repetitive text")
 
     parser.add_argument("--no_sample", action="store_true",
                        help="Disable sampling (use greedy decoding)")
@@ -310,6 +409,8 @@ def main():
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_p=args.top_p,
+        top_k=args.top_k,
+        repetition_penalty=args.repetition_penalty,
         do_sample=not args.no_sample
     )
     
