@@ -53,34 +53,39 @@ class TextDataset(Dataset):
             'prompt_length': len(inputs['input_ids'].squeeze())
         }
 
-def collate_fn(batch):
+class CollateFn:
     """Custom collate function for batching"""
-    input_ids = [item['input_ids'] for item in batch]
-    attention_masks = [item['attention_mask'] for item in batch]
-    original_texts = [item['original_text'] for item in batch]
-    prompt_lengths = [item['prompt_length'] for item in batch]
     
-    # Pad sequences to the same length
-    max_len = max(len(ids) for ids in input_ids)
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
     
-    padded_input_ids = []
-    padded_attention_masks = []
-    
-    for i, (ids, mask) in enumerate(zip(input_ids, attention_masks)):
-        pad_length = max_len - len(ids)
-        # Pad from left for generation
-        padded_ids = torch.cat([torch.full((pad_length,), tokenizer.pad_token_id), ids])
-        padded_mask = torch.cat([torch.zeros(pad_length), mask])
+    def __call__(self, batch):
+        input_ids = [item['input_ids'] for item in batch]
+        attention_masks = [item['attention_mask'] for item in batch]
+        original_texts = [item['original_text'] for item in batch]
+        prompt_lengths = [item['prompt_length'] for item in batch]
         
-        padded_input_ids.append(padded_ids)
-        padded_attention_masks.append(padded_mask)
-    
-    return {
-        'input_ids': torch.stack(padded_input_ids),
-        'attention_mask': torch.stack(padded_attention_masks),
-        'original_texts': original_texts,
-        'prompt_lengths': prompt_lengths
-    }
+        # Pad sequences to the same length
+        max_len = max(len(ids) for ids in input_ids)
+        
+        padded_input_ids = []
+        padded_attention_masks = []
+        
+        for i, (ids, mask) in enumerate(zip(input_ids, attention_masks)):
+            pad_length = max_len - len(ids)
+            # Pad from left for generation
+            padded_ids = torch.cat([torch.full((pad_length,), self.tokenizer.pad_token_id), ids])
+            padded_mask = torch.cat([torch.zeros(pad_length), mask])
+            
+            padded_input_ids.append(padded_ids)
+            padded_attention_masks.append(padded_mask)
+        
+        return {
+            'input_ids': torch.stack(padded_input_ids),
+            'attention_mask': torch.stack(padded_attention_masks),
+            'original_texts': original_texts,
+            'prompt_lengths': prompt_lengths
+        }
 
 class QwenInference:
     """Qwen model inference class with multi-GPU support"""
@@ -225,6 +230,7 @@ class QwenInference:
         
         # Create dataset and dataloader
         dataset = TextDataset(valid_texts, self.tokenizer)
+        collate_fn = CollateFn(self.tokenizer)
         dataloader = DataLoader(
             dataset, 
             batch_size=batch_size, 
