@@ -24,7 +24,7 @@ class QwenFineTuner:
     
     def __init__(self, 
                  model_name: str = "Qwen/Qwen2.5-8B-Instruct",
-                 use_quantization: bool = True,
+                 use_quantization: bool = False,
                  use_lora: bool = True):
         self.model_name = model_name
         self.use_quantization = use_quantization
@@ -49,24 +49,23 @@ class QwenFineTuner:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
         
-        # Setup quantization config if needed
-        quantization_config = None
-        if self.use_quantization:
-            quantization_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_use_double_quant=True,
-            )
-        
-        # Load model
+        # Load model directly to GPU without quantization
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
-            quantization_config=quantization_config,
             device_map="auto",
             trust_remote_code=True,
-            torch_dtype=torch.float16 if not self.use_quantization else None
+            torch_dtype=torch.float16
         )
+        
+        logger.info("Model loaded in FP16 without quantization for GPU training")
+        
+        # Print GPU memory usage
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                memory_allocated = torch.cuda.memory_allocated(i) / 1024**3
+                memory_reserved = torch.cuda.memory_reserved(i) / 1024**3
+                memory_total = torch.cuda.get_device_properties(i).total_memory / 1024**3
+                logger.info(f"GPU {i} Memory - Allocated: {memory_allocated:.2f}GB, Reserved: {memory_reserved:.2f}GB, Total: {memory_total:.2f}GB")
         
         # Setup LoRA if specified
         if self.use_lora:
@@ -155,9 +154,9 @@ class QwenFineTuner:
     def setup_training_arguments(self, 
                                 output_dir: str = "./qwen_advertising_copy",
                                 num_train_epochs: int = 3,
-                                per_device_train_batch_size: int = 4,
-                                per_device_eval_batch_size: int = 4,
-                                gradient_accumulation_steps: int = 4,
+                                                 per_device_train_batch_size: int = 8,
+                 per_device_eval_batch_size: int = 8,
+                 gradient_accumulation_steps: int = 2,
                                 learning_rate: float = 5e-5,
                                 warmup_steps: int = 100,
                                 logging_steps: int = 10,
@@ -188,6 +187,8 @@ class QwenFineTuner:
             fp16=True,
             dataloader_pin_memory=False,
             remove_unused_columns=False,
+            gradient_checkpointing=True,  # Enable gradient checkpointing for memory efficiency
+            dataloader_num_workers=4,
             report_to="wandb" if use_wandb else None,
             run_name="qwen-advertising-copy-finetune" if use_wandb else None,
         )
@@ -240,11 +241,11 @@ def main():
         "data_path": "training_data.json",
         "output_dir": "./qwen_advertising_copy",
         "model_name": "Qwen/Qwen2.5-8B-Instruct",
-        "use_quantization": True,
+        "use_quantization": False,
         "use_lora": True,
         "num_train_epochs": 3,
-        "per_device_train_batch_size": 2,
-        "gradient_accumulation_steps": 8,
+        "per_device_train_batch_size": 4,
+        "gradient_accumulation_steps": 4,
         "learning_rate": 5e-5,
         "warmup_steps": 100,
         "logging_steps": 10,
@@ -256,6 +257,24 @@ def main():
     # Check if data file exists
     if not os.path.exists(config["data_path"]):
         logger.error(f"Data file {config['data_path']} not found. Please run data_preprocessing.py first.")
+        return
+    
+    # Check GPU availability and memory
+    if torch.cuda.is_available():
+        num_gpus = torch.cuda.device_count()
+        logger.info(f"Found {num_gpus} GPU(s) for training")
+        for i in range(num_gpus):
+            gpu_name = torch.cuda.get_device_name(i)
+            gpu_memory = torch.cuda.get_device_properties(i).total_memory / 1024**3
+            logger.info(f"GPU {i}: {gpu_name} ({gpu_memory:.1f}GB)")
+            
+        # Memory requirement warning
+        total_memory = sum(torch.cuda.get_device_properties(i).total_memory for i in range(num_gpus)) / 1024**3
+        logger.info(f"Total GPU memory: {total_memory:.1f}GB")
+        if total_memory < 32:
+            logger.warning("GPU memory may be insufficient for full precision training. Consider reducing batch size or enabling quantization.")
+    else:
+        logger.error("No CUDA GPUs found. GPU training requires NVIDIA GPU with CUDA support.")
         return
     
     # Initialize fine-tuner
