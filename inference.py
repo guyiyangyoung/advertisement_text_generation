@@ -2,6 +2,7 @@ import os
 import torch
 import pandas as pd
 import json
+import re
 from transformers import (
     AutoTokenizer, 
     AutoModelForCausalLM
@@ -148,6 +149,39 @@ class QwenInference:
             # Remove any end tokens
             if "<|im_end|>" in generated_text:
                 generated_text = generated_text.split("<|im_end|>")[0]
+            
+            # Comprehensive cleaning of generated text
+            
+            # 1. Remove <think> tags and their content (case insensitive)
+            generated_text = re.sub(r'<think>.*?</think>', '', generated_text, flags=re.DOTALL | re.IGNORECASE)
+            
+            # 2. Remove genre/style tags like 【穿越重生+女扮男装+先知预言+权谋斗争】
+            generated_text = re.sub(r'【[^】]*】', '', generated_text)
+            
+            # 3. Remove square bracket tags like [标签内容]
+            generated_text = re.sub(r'\[[^\]]*\]', '', generated_text)
+            
+            # 4. Remove any other HTML-like tags
+            generated_text = re.sub(r'<[^>]*>', '', generated_text)
+            
+            # 5. Remove common unwanted phrases/patterns at the beginning
+            unwanted_patterns = [
+                r'^.*?(?=[\u4e00-\u9fff])',  # Remove anything before first Chinese character
+                r'^[+\-=*]*',  # Remove leading symbols
+                r'^\s*类型[:：].*?\n',  # Remove type labels
+                r'^\s*风格[:：].*?\n',  # Remove style labels
+            ]
+            
+            for pattern in unwanted_patterns:
+                generated_text = re.sub(pattern, '', generated_text, flags=re.MULTILINE)
+            
+            # 6. Clean up whitespace
+            generated_text = re.sub(r'\n\s*\n\s*\n+', '\n\n', generated_text)  # Multiple newlines to double
+            generated_text = re.sub(r'^\s+|\s+$', '', generated_text)  # Trim whitespace
+            generated_text = re.sub(r' +', ' ', generated_text)  # Multiple spaces to single
+            
+            # 7. Remove any remaining empty lines at the start
+            generated_text = generated_text.lstrip('\n ')
             
             logger.debug(f"Extracted generated text: {generated_text[:200]}...")
             return generated_text.strip()
