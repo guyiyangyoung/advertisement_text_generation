@@ -4,8 +4,10 @@
 
 ## 文件说明
 
+- `chapter_summarizer_fixed.py` - **主要脚本**（推荐使用，针对您的数据格式优化）
+- `test_data_parsing.py` - 数据解析测试脚本
 - `chapter_summarizer.py` - 基础版本的章节概括脚本
-- `chapter_summarizer_qwen3.py` - 专门针对Qwen3-8B优化的版本（推荐使用）
+- `chapter_summarizer_qwen3.py` - 专门针对Qwen3-8B优化的版本
 - `requirements.txt` - 依赖包列表
 - `test.csv` - 输入数据文件（包含chapters_text列）
 
@@ -17,13 +19,22 @@ pip install -r requirements.txt
 
 ## 使用方法
 
-### 方法1：使用基础版本
+### 第一步：测试数据解析（推荐）
 ```bash
-python chapter_summarizer.py
+python test_data_parsing.py
 ```
 
-### 方法2：使用Qwen3优化版本（推荐）
+### 第二步：运行主程序（推荐使用）
 ```bash
+python chapter_summarizer_fixed.py
+```
+
+### 其他版本：
+```bash
+# 基础版本
+python chapter_summarizer.py
+
+# Qwen3优化版本
 python chapter_summarizer_qwen3.py
 ```
 
