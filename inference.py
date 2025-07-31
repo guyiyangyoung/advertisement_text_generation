@@ -10,8 +10,6 @@ from transformers import (
 from peft import PeftModel
 import argparse
 import logging
-from torch.nn import DataParallel
-from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 import time
 
@@ -19,76 +17,8 @@ import time
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class TextDataset(Dataset):
-    """Dataset for text inference"""
-    
-    def __init__(self, texts, tokenizer, max_length=4096):
-        self.texts = texts
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-    
-    def __len__(self):
-        return len(self.texts)
-    
-    def __getitem__(self, idx):
-        text = self.texts[idx]
-        # Format the input according to training format
-        user_message = f"请根据以下小说章节内容，生成一段精彩的口播文案，要求语言生动、有感染力，能够激发读者的阅读兴趣。\n\n{text}"
-        
-        conversation = f"<|im_start|>system\n你是一名资深纯小说内容口播文案的策划，擅长精准捕捉小说核心卖点，能用口语化、有感染力的表达激发读者阅读欲，尤其擅长适配不同题材的语言风格，精通听觉化表达设计（如语气调控、短句优化），能根据具体题材调整叙事节奏和情感侧重。<|im_end|>\n<|im_start|>user\n{user_message}<|im_end|>\n<|im_start|>assistant\n"
-        
-        # Tokenize
-        inputs = self.tokenizer(
-            conversation,
-            truncation=True,
-            max_length=self.max_length,
-            padding=False,
-            return_tensors="pt"
-        )
-        
-        return {
-            'input_ids': inputs['input_ids'].squeeze(),
-            'attention_mask': inputs['attention_mask'].squeeze(),
-            'original_text': text,
-            'prompt_length': len(inputs['input_ids'].squeeze())
-        }
-
-class CollateFn:
-    """Custom collate function for batching"""
-    
-    def __init__(self, tokenizer):
-        self.tokenizer = tokenizer
-    
-    def __call__(self, batch):
-        input_ids = [item['input_ids'] for item in batch]
-        attention_masks = [item['attention_mask'] for item in batch]
-        original_texts = [item['original_text'] for item in batch]
-        prompt_lengths = [item['prompt_length'] for item in batch]
-        
-        # Pad sequences to the same length
-        max_len = max(len(ids) for ids in input_ids)
-        
-        padded_input_ids = []
-        padded_attention_masks = []
-        
-        for i, (ids, mask) in enumerate(zip(input_ids, attention_masks)):
-            pad_length = max_len - len(ids)
-            # Pad from left for generation
-            padded_ids = torch.cat([torch.full((pad_length,), self.tokenizer.pad_token_id), ids])
-            padded_mask = torch.cat([torch.zeros(pad_length), mask])
-            
-            padded_input_ids.append(padded_ids)
-            padded_attention_masks.append(padded_mask)
-        
-        return {
-            'input_ids': torch.stack(padded_input_ids),
-            'attention_mask': torch.stack(padded_attention_masks),
-            'original_texts': original_texts,
-            'prompt_lengths': prompt_lengths
-        }
-
 class QwenInference:
-    """Qwen model inference class with multi-GPU support"""
+    """Qwen model inference class with GPU support"""
     
     def __init__(self, 
                  model_path: str = "/mnt/bn/ug-diffusion-lq/guyiyang/qwen_advertising_copy",
@@ -157,11 +87,6 @@ class QwenInference:
         # Merge weights for faster inference
         self.model = self.model.merge_and_unload()
         
-        # Use DataParallel for multi-GPU inference if available
-        if self.device_count > 1 and not self.use_quantization:
-            logger.info(f"Using DataParallel across {self.device_count} GPUs")
-            self.model = DataParallel(self.model)
-        
         self.model.eval()
         
         logger.info("Model loaded successfully")
@@ -173,20 +98,33 @@ class QwenInference:
                 memory_reserved = torch.cuda.memory_reserved(i) / 1024**3
                 logger.info(f"GPU {i} Memory - Allocated: {memory_allocated:.2f}GB, Reserved: {memory_reserved:.2f}GB")
     
-    def generate_batch(self, batch):
-        """Generate outputs for a batch of inputs"""
-        input_ids = batch['input_ids']
-        attention_mask = batch['attention_mask']
+    def generate_single(self, text):
+        """Generate output for a single input text"""
+        # Format the input according to training format
+        user_message = f"请根据以下小说章节内容，生成一段精彩的口播文案，要求语言生动、有感染力，能够激发读者的阅读兴趣。\n\n{text}"
         
-        if self.device_count > 0:
-            input_ids = input_ids.cuda()
-            attention_mask = attention_mask.cuda()
+        conversation = f"<|im_start|>system\n你是一名资深纯小说内容口播文案的策划，擅长精准捕捉小说核心卖点，能用口语化、有感染力的表达激发读者阅读欲，尤其擅长适配不同题材的语言风格，精通听觉化表达设计（如语气调控、短句优化），能根据具体题材调整叙事节奏和情感侧重。<|im_end|>\n<|im_start|>user\n{user_message}<|im_end|>\n<|im_start|>assistant\n"
+        
+        # Tokenize
+        inputs = self.tokenizer(
+            conversation,
+            truncation=True,
+            max_length=4096,
+            padding=False,
+            return_tensors="pt"
+        )
+        
+        # Move to GPU if available
+        if torch.cuda.is_available():
+            inputs = {k: v.cuda() for k, v in inputs.items()}
+        
+        prompt_length = inputs['input_ids'].shape[1]
         
         with torch.no_grad():
             # Generate outputs
             outputs = self.model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
+                input_ids=inputs['input_ids'],
+                attention_mask=inputs['attention_mask'],
                 max_new_tokens=self.max_new_tokens,
                 temperature=self.temperature,
                 top_p=self.top_p,
@@ -198,17 +136,13 @@ class QwenInference:
                 num_return_sequences=1
             )
         
-        # Decode outputs
-        generated_texts = []
-        for i, (output, prompt_length) in enumerate(zip(outputs, batch['prompt_lengths'])):
-            # Extract only the generated part (after the prompt)
-            generated_tokens = output[prompt_length:]
-            generated_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
-            generated_texts.append(generated_text.strip())
+        # Extract only the generated part (after the prompt)
+        generated_tokens = outputs[0][prompt_length:]
+        generated_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
         
-        return generated_texts
+        return generated_text.strip()
     
-    def infer_from_csv(self, csv_path: str, output_path: str, batch_size: int = 4):
+    def infer_from_csv(self, csv_path: str, output_path: str):
         """Run inference on test.csv and save results"""
         logger.info(f"Loading data from {csv_path}")
         
@@ -222,72 +156,50 @@ class QwenInference:
         
         texts = df['chapters_text'].fillna("").astype(str).tolist()
         
-        # Filter out empty texts
-        valid_indices = [i for i, text in enumerate(texts) if text.strip()]
-        valid_texts = [texts[i] for i in valid_indices]
-        
-        logger.info(f"Processing {len(valid_texts)} valid texts")
-        
-        # Create dataset and dataloader
-        dataset = TextDataset(valid_texts, self.tokenizer)
-        collate_fn = CollateFn(self.tokenizer)
-        dataloader = DataLoader(
-            dataset, 
-            batch_size=batch_size, 
-            shuffle=False, 
-            collate_fn=collate_fn,
-            num_workers=0  # Set to 0 to avoid multiprocessing issues with CUDA
-        )
-        
-        # Run inference
+        # Run inference for each text
         all_results = []
+        generated_outputs = []
         start_time = time.time()
         
-        logger.info(f"Starting inference with batch size {batch_size}")
+        logger.info("Starting inference...")
         
-        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Generating")):
+        for i, text in enumerate(tqdm(texts, desc="Generating")):
             try:
-                generated_texts = self.generate_batch(batch)
-                
-                # Store results
-                for original_text, generated_text in zip(batch['original_texts'], generated_texts):
+                if text.strip():  # Only process non-empty texts
+                    generated_text = self.generate_single(text)
+                    generated_outputs.append(generated_text)
+                    
                     all_results.append({
-                        'input_text': original_text,
+                        'input_text': text,
                         'generated_output': generated_text
                     })
+                else:
+                    generated_outputs.append("Error: Empty input text")
+                    all_results.append({
+                        'input_text': text,
+                        'generated_output': "Error: Empty input text"
+                    })
                 
-                # Log progress
-                if (batch_idx + 1) % 10 == 0:
+                # Log progress every 10 samples
+                if (i + 1) % 10 == 0:
                     elapsed_time = time.time() - start_time
-                    avg_time_per_batch = elapsed_time / (batch_idx + 1)
-                    logger.info(f"Processed {batch_idx + 1} batches, avg time per batch: {avg_time_per_batch:.2f}s")
+                    avg_time_per_sample = elapsed_time / (i + 1)
+                    remaining_samples = len(texts) - (i + 1)
+                    estimated_remaining_time = avg_time_per_sample * remaining_samples
+                    logger.info(f"Processed {i + 1}/{len(texts)} samples, "
+                              f"avg time per sample: {avg_time_per_sample:.2f}s, "
+                              f"estimated remaining time: {estimated_remaining_time/60:.1f} minutes")
                 
             except Exception as e:
-                logger.error(f"Error processing batch {batch_idx}: {e}")
-                # Add empty results for this batch to maintain alignment
-                for original_text in batch['original_texts']:
-                    all_results.append({
-                        'input_text': original_text,
-                        'generated_output': f"Error: {str(e)}"
-                    })
+                logger.error(f"Error processing sample {i}: {e}")
+                generated_outputs.append(f"Error: {str(e)}")
+                all_results.append({
+                    'input_text': text,
+                    'generated_output': f"Error: {str(e)}"
+                })
         
         # Create output dataframe
         output_df = df.copy()
-        
-        # Map results back to original dataframe
-        generated_outputs = [""] * len(df)
-        result_idx = 0
-        
-        for i in range(len(df)):
-            if i in valid_indices:
-                if result_idx < len(all_results):
-                    generated_outputs[i] = all_results[result_idx]['generated_output']
-                    result_idx += 1
-                else:
-                    generated_outputs[i] = "Error: No result generated"
-            else:
-                generated_outputs[i] = "Error: Empty input text"
-        
         output_df['generated_advertising_copy'] = generated_outputs
         
         # Save results
@@ -319,8 +231,6 @@ def main():
                        help="Path to test CSV file")
     parser.add_argument("--output_path", type=str, default="inference_results.csv",
                        help="Path to save results")
-    parser.add_argument("--batch_size", type=int, default=4,
-                       help="Batch size for inference")
     parser.add_argument("--max_new_tokens", type=int, default=512,
                        help="Maximum number of new tokens to generate")
     parser.add_argument("--temperature", type=float, default=0.7,
@@ -357,8 +267,7 @@ def main():
     # Run inference
     results = inference.infer_from_csv(
         csv_path=args.csv_path,
-        output_path=args.output_path,
-        batch_size=args.batch_size
+        output_path=args.output_path
     )
     
     logger.info("Inference completed successfully!")
