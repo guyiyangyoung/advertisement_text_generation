@@ -4,8 +4,7 @@ import pandas as pd
 import json
 from transformers import (
     AutoTokenizer, 
-    AutoModelForCausalLM, 
-    BitsAndBytesConfig
+    AutoModelForCausalLM
 )
 from peft import PeftModel
 import argparse
@@ -23,7 +22,6 @@ class QwenInference:
     def __init__(self, 
                  model_path: str = "/mnt/bn/ug-diffusion-lq/guyiyang/qwen_advertising_copy",
                  base_model_path: str = "/mnt/bn/ug-diffusion-lq/guyiyang/Qwen3-8B",
-                 use_quantization: bool = True,
                  max_new_tokens: int = 512,
                  temperature: float = 0.7,
                  top_p: float = 0.9,
@@ -31,7 +29,6 @@ class QwenInference:
         
         self.model_path = model_path
         self.base_model_path = base_model_path
-        self.use_quantization = use_quantization
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.top_p = top_p
@@ -59,25 +56,13 @@ class QwenInference:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
         
-        # Setup quantization config if needed
-        quantization_config = None
-        if self.use_quantization:
-            quantization_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_use_double_quant=True,
-            )
-            logger.info("Using 4-bit quantization for memory efficiency")
-        
         # Load base model
         logger.info(f"Loading base model from {self.base_model_path}")
         base_model = AutoModelForCausalLM.from_pretrained(
             self.base_model_path,
-            quantization_config=quantization_config,
             device_map="auto" if self.device_count > 1 else "cuda:0",
             trust_remote_code=True,
-            torch_dtype=torch.float16 if not self.use_quantization else None
+            torch_dtype=torch.float16
         )
         
         # Load fine-tuned weights
@@ -237,8 +222,7 @@ def main():
                        help="Temperature for generation")
     parser.add_argument("--top_p", type=float, default=0.9,
                        help="Top-p for nucleus sampling")
-    parser.add_argument("--no_quantization", action="store_true",
-                       help="Disable quantization")
+
     parser.add_argument("--no_sample", action="store_true",
                        help="Disable sampling (use greedy decoding)")
     
@@ -254,7 +238,6 @@ def main():
     inference = QwenInference(
         model_path=args.model_path,
         base_model_path=args.base_model_path,
-        use_quantization=not args.no_quantization,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_p=args.top_p,
