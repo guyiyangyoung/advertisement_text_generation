@@ -13,7 +13,7 @@ from tqdm import tqdm
 import time
 
 # Setup logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 class QwenInference:
@@ -105,6 +105,10 @@ class QwenInference:
         
         prompt_length = inputs['input_ids'].shape[1]
         
+        # Debug: Print prompt info
+        logger.debug(f"Prompt length: {prompt_length}")
+        logger.debug(f"Prompt text: {conversation[:200]}...")
+        
         with torch.no_grad():
             # Generate outputs
             outputs = self.model.generate(
@@ -121,11 +125,35 @@ class QwenInference:
                 num_return_sequences=1
             )
         
-        # Extract only the generated part (after the prompt)
-        generated_tokens = outputs[0][prompt_length:]
-        generated_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        # Debug: Print generation info
+        total_length = outputs[0].shape[0]
+        logger.debug(f"Total generated length: {total_length}")
+        logger.debug(f"New tokens generated: {total_length - prompt_length}")
         
-        return generated_text.strip()
+        # Decode the full output first to debug
+        full_output = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        logger.debug(f"Full output: {full_output[:500]}...")
+        
+        # Extract only the generated part (after the prompt)
+        if total_length > prompt_length:
+            generated_tokens = outputs[0][prompt_length:]
+            generated_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            
+            # Further clean up: remove any remaining prompt artifacts
+            # Look for the assistant response start
+            if "<|im_start|>assistant\n" in full_output:
+                assistant_start = full_output.find("<|im_start|>assistant\n") + len("<|im_start|>assistant\n")
+                generated_text = full_output[assistant_start:]
+            
+            # Remove any end tokens
+            if "<|im_end|>" in generated_text:
+                generated_text = generated_text.split("<|im_end|>")[0]
+            
+            logger.debug(f"Extracted generated text: {generated_text[:200]}...")
+            return generated_text.strip()
+        else:
+            logger.warning("No new tokens were generated!")
+            return "Error: No new content generated"
     
     def infer_from_csv(self, csv_path: str, output_path: str):
         """Run inference on test.csv and save results"""
@@ -225,8 +253,15 @@ def main():
 
     parser.add_argument("--no_sample", action="store_true",
                        help="Disable sampling (use greedy decoding)")
+    parser.add_argument("--debug", action="store_true",
+                       help="Enable debug logging")
     
     args = parser.parse_args()
+    
+    # Set debug logging if requested
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.setLevel(logging.DEBUG)
     
     # Check if GPU is available
     if not torch.cuda.is_available():
@@ -256,5 +291,29 @@ def main():
     logger.info("Inference completed successfully!")
     logger.info(f"Generated outputs for {len(results)} samples")
 
+def test_single_generation():
+    """Test function to verify generation works correctly"""
+    logger.info("Running single generation test...")
+    
+    # Initialize inference class
+    inference = QwenInference()
+    
+    # Load model
+    inference.load_model()
+    
+    # Test with a simple text
+    test_text = "沈从妩觉得自己简直是个大冤种，好不容易把家里的跋扈二世祖调教成状元郎，自己也封了诰命，正要走上人生巅峰，怎么一睁眼就回到了解放前？"
+    
+    result = inference.generate_single(test_text)
+    
+    logger.info(f"Test input: {test_text[:100]}...")
+    logger.info(f"Test output: {result}")
+    
+    return result
+
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "test":
+        test_single_generation()
+    else:
+        main()
