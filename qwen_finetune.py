@@ -24,7 +24,7 @@ class QwenFineTuner:
     
     def __init__(self, 
                  model_name: str = "Qwen/Qwen2.5-8B-Instruct",
-                 use_quantization: bool = False,
+                 use_quantization: bool = True,
                  use_lora: bool = True):
         self.model_name = model_name
         self.use_quantization = use_quantization
@@ -49,15 +49,25 @@ class QwenFineTuner:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
         
-        # Load model directly to GPU without quantization
+        # Setup quantization config if needed
+        quantization_config = None
+        if self.use_quantization:
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+            )
+            logger.info("Using 4-bit quantization for memory efficiency")
+        
+        # Load model
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
+            quantization_config=quantization_config,
             device_map="auto",
             trust_remote_code=True,
-            torch_dtype=torch.float16
+            torch_dtype=torch.float16 if not self.use_quantization else None
         )
-        
-        logger.info("Model loaded in FP16 without quantization for GPU training")
         
         # Print GPU memory usage
         if torch.cuda.is_available():
@@ -154,9 +164,9 @@ class QwenFineTuner:
     def setup_training_arguments(self, 
                                 output_dir: str = "./qwen_advertising_copy",
                                 num_train_epochs: int = 3,
-                                                 per_device_train_batch_size: int = 8,
-                 per_device_eval_batch_size: int = 8,
-                 gradient_accumulation_steps: int = 2,
+                                                 per_device_train_batch_size: int = 2,
+                 per_device_eval_batch_size: int = 2,
+                 gradient_accumulation_steps: int = 8,
                                 learning_rate: float = 5e-5,
                                 warmup_steps: int = 100,
                                 logging_steps: int = 10,
@@ -241,11 +251,11 @@ def main():
         "data_path": "training_data.json",
         "output_dir": "./qwen_advertising_copy",
         "model_name": "Qwen/Qwen2.5-8B-Instruct",
-        "use_quantization": False,
+        "use_quantization": True,
         "use_lora": True,
         "num_train_epochs": 3,
-        "per_device_train_batch_size": 4,
-        "gradient_accumulation_steps": 4,
+        "per_device_train_batch_size": 2,
+        "gradient_accumulation_steps": 8,
         "learning_rate": 5e-5,
         "warmup_steps": 100,
         "logging_steps": 10,
@@ -271,8 +281,14 @@ def main():
         # Memory requirement warning
         total_memory = sum(torch.cuda.get_device_properties(i).total_memory for i in range(num_gpus)) / 1024**3
         logger.info(f"Total GPU memory: {total_memory:.1f}GB")
-        if total_memory < 32:
-            logger.warning("GPU memory may be insufficient for full precision training. Consider reducing batch size or enabling quantization.")
+        if config["use_quantization"]:
+            logger.info("Using 4-bit quantization - minimum 12GB GPU memory recommended")
+            if total_memory < 12:
+                logger.warning("GPU memory may be insufficient even with quantization. Consider reducing batch size.")
+        else:
+            logger.info("Using full precision - minimum 32GB GPU memory recommended")
+            if total_memory < 32:
+                logger.warning("GPU memory may be insufficient for full precision training. Consider enabling quantization.")
     else:
         logger.error("No CUDA GPUs found. GPU training requires NVIDIA GPU with CUDA support.")
         return
