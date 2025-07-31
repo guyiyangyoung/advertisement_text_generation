@@ -6,8 +6,7 @@ from transformers import (
     AutoModelForCausalLM, 
     TrainingArguments, 
     Trainer,
-    DataCollatorForSeq2Seq,
-    BitsAndBytesConfig
+    DataCollatorForSeq2Seq
 )
 from datasets import Dataset
 from peft import LoraConfig, get_peft_model, TaskType
@@ -23,10 +22,8 @@ class SingleGPUQwenFineTuner:
     
     def __init__(self, 
                  model_name: str = "/mnt/bn/ug-diffusion-lq/guyiyang/Qwen3-8B",
-                 use_quantization: bool = True,
                  use_lora: bool = True):
         self.model_name = model_name
-        self.use_quantization = use_quantization
         self.use_lora = use_lora
         self.tokenizer = None
         self.model = None
@@ -48,24 +45,12 @@ class SingleGPUQwenFineTuner:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
         
-        # Setup quantization config if needed
-        quantization_config = None
-        if self.use_quantization:
-            quantization_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_use_double_quant=True,
-            )
-            logger.info("Using 4-bit quantization for memory efficiency")
-        
         # Load model
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
-            quantization_config=quantization_config,
             device_map="auto",
             trust_remote_code=True,
-            torch_dtype=torch.float16 if not self.use_quantization else None
+            torch_dtype=torch.float16
         )
         
         # Setup LoRA if specified
@@ -251,8 +236,7 @@ def main():
                        help="Learning rate")
     parser.add_argument("--use_wandb", action="store_true",
                        help="Use Weights & Biases for logging")
-    parser.add_argument("--no_quantization", action="store_true",
-                       help="Disable quantization")
+
     parser.add_argument("--no_lora", action="store_true",
                        help="Disable LoRA")
     
@@ -273,7 +257,6 @@ def main():
     
     # Initialize fine-tuner
     fine_tuner = SingleGPUQwenFineTuner(
-        use_quantization=not args.no_quantization,
         use_lora=not args.no_lora
     )
     
